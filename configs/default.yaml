@@ -1,0 +1,46 @@
+seed: 42
+lookback: 60
+horizon: 1
+num_features: 12
+num_scales: 3
+tau1: 5
+tau2: 20
+ceemdan_ensemble: 50
+decomp_refresh: 5
+embed_dim: 64
+num_heads: 4
+num_layers: 2
+ffn_dim: 256
+dropout: 0.1
+lambda_quantile: 0.3
+lambda_direction: 0.5
+lambda_vol: 0.1
+batch_size: 64
+lr: 0.001
+lr_decay: 0.5
+lr_patience: 5
+early_stop_patience: 15
+max_epochs: 200
+num_seeds: 5
+train_ratio: 0.70
+val_ratio: 0.15
+test_ratio: 0.15
+datasets:
+  - spx
+  - csi300
+  - nasdaq20
+  - btc_usd
+models:
+  - arima
+  - gru
+  - lstm
+  - cnn_lstm
+  - informer
+  - autoformer
+  - timesnet
+  - nhits
+  - patchtst
+  - itransformer
+  - msdat
+data_dir: data/processed
+output_dir: outputs
