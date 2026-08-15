@@ -1,31 +1,44 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
 
 class CompositeLoss(nn.Module):
-    def __init__(self, l_q=0.3, l_d=0.5, l_v=0.1):
+    def __init__(
+        self,
+        lambda_quantile: float = 0.3,
+        lambda_dir: float = 0.5,
+        lambda_vol: float = 0.1,
+        use_dir_loss: bool = True,
+    ):
         super().__init__()
-        self.l_q = l_q
-        self.l_d = l_d
-        self.l_v = l_v
-        self.mse = nn.MSELoss()
+        self.lambda_quantile = lambda_quantile
+        self.lambda_dir = lambda_dir if use_dir_loss else 0.0
+        self.lambda_vol = lambda_vol
 
-    def pinball(self, pred, target, q):
-        err = target - pred
-        return torch.max(q * err, (q - 1) * err).mean()
-
-    def forward(self, outputs, batch, recent_preds=None):
-        point, q_low, q_high, direction = outputs[:4]
+    def forward(self, out: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         y = batch["y"]
-        p_t = batch["p_t"]
-        y_raw = batch["y_raw"]
-        l_point = self.mse(point, y)
-        l_q = self.pinball(q_low, y, 0.1) + self.pinball(q_high, y, 0.9)
-        sign = torch.sign(y_raw - p_t)
-        l_d = torch.relu(-direction * sign).mean()
-        l_v = torch.tensor(0.0, device=y.device)
-        if recent_preds is not None and len(recent_preds) >= 5:
-            pred_vol = torch.std(recent_preds[-5:])
-            real_vol = batch["vol"].mean()
-            l_v = (pred_vol - real_vol).pow(2)
-        return l_point + self.l_q * l_q + self.l_d * l_d + self.l_v * l_v
+        point = out["point"]
+        point_loss = torch.mean((point - y) ** 2)
+        q10 = torch.maximum(0.1 * (y - out["q10"]), (0.1 - 1.0) * (y - out["q10"]))
+        q90 = torch.maximum(0.9 * (y - out["q90"]), (0.9 - 1.0) * (y - out["q90"]))
+        quantile_loss = torch.mean(q10 + q90)
+        direction = torch.sign(y - batch["p_last"])
+        dir_loss = torch.mean(torch.clamp(-out["dir_logit"] * direction, min=0.0))
+        pred_vol = torch.std(point, unbiased=False)
+        real_vol = torch.std(y, unbiased=False)
+        vol_loss = (pred_vol - real_vol) ** 2
+        total = (
+            point_loss
+            + self.lambda_quantile * quantile_loss
+            + self.lambda_dir * dir_loss
+            + self.lambda_vol * vol_loss
+        )
+        return {
+            "loss": total,
+            "point": point_loss.detach(),
+            "quantile": quantile_loss.detach(),
+            "dir": dir_loss.detach(),
+            "vol": vol_loss.detach(),
+        }

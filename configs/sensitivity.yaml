@@ -1,0 +1,6 @@
+lookbacks: [20, 40, 60, 80, 100]
+n_scales: [2, 3, 4, 5]
+default_lookback: 60
+default_n_scales: 3
+datasets: [SPX, CSI300, NASDAQ-20, BTC-USD]
+seed: 42

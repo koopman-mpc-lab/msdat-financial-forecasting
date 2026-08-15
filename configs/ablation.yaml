@@ -1,0 +1,43 @@
+variants:
+  no_decomp:
+    label: No decomposition
+    n_scales: 1
+    use_channel_attention: true
+    temporal: attention
+    fixed_fusion: false
+    use_dir_loss: true
+  gru_encoder:
+    label: GRU temporal encoder
+    n_scales: 3
+    use_channel_attention: true
+    temporal: gru
+    fixed_fusion: false
+    use_dir_loss: true
+  no_channel:
+    label: No channel attention
+    n_scales: 3
+    use_channel_attention: false
+    temporal: attention
+    fixed_fusion: false
+    use_dir_loss: true
+  fixed_fusion:
+    label: Fixed scale fusion
+    n_scales: 3
+    use_channel_attention: true
+    temporal: attention
+    fixed_fusion: true
+    use_dir_loss: true
+  no_dir:
+    label: No directional loss
+    n_scales: 3
+    use_channel_attention: true
+    temporal: attention
+    fixed_fusion: false
+    use_dir_loss: false
+  full:
+    label: Full MSDAT
+    n_scales: 3
+    use_channel_attention: true
+    temporal: attention
+    fixed_fusion: false
+    use_dir_loss: true

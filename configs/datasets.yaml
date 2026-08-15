@@ -1,0 +1,48 @@
+SPX:
+  name: SPX
+  calendar: nyse
+  start: "2010-01-04"
+  end: "2024-12-31"
+  n_days: 3775
+  split: [2642, 566, 567]
+  feature_dir: data/features/SPX
+  liquidity: turnover
+  series: [SPX]
+
+CSI300:
+  name: CSI300
+  calendar: sse
+  start: "2010-01-04"
+  end: "2024-12-31"
+  n_days: 3650
+  split: [2555, 547, 548]
+  feature_dir: data/features/CSI300
+  liquidity: turnover
+  series: [CSI300]
+
+NASDAQ-20:
+  name: NASDAQ-20
+  calendar: nasdaq
+  start: "2015-01-02"
+  end: "2024-12-31"
+  n_days: 2515
+  split: [1760, 377, 378]
+  feature_dir: data/features/NASDAQ-20
+  liquidity: turnover
+  series:
+    technology: [AAPL, MSFT, GOOGL, NVDA]
+    financials: [JPM, BAC, GS, V]
+    healthcare: [UNH, JNJ, PFE, ABBV]
+    energy: [XOM, CVX, COP, SLB]
+    consumer_discretionary: [AMZN, HD, MCD, NKE]
+
+BTC-USD:
+  name: BTC-USD
+  calendar: crypto
+  start: "2015-01-01"
+  end: "2024-12-31"
+  n_days: 3652
+  split: [2556, 548, 548]
+  feature_dir: data/features/BTC-USD
+  liquidity: realized_vol_5
+  series: [BTC-USD]

@@ -1,27 +1,29 @@
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any
+
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
-FEATURE_COLS = [
-    "open", "high", "low", "close", "volume",
-    "ma5", "ma10", "ma20", "rsi14", "macd_hist",
-    "bb_width", "liquidity",
-]
 
-DATASET_FILES = {
-    "spx": "spx.csv",
-    "csi300": "csi300.csv",
-    "nasdaq20": "nasdaq20.csv",
-    "btc_usd": "btc_usd.csv",
-}
+def load_yaml(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    if not path.is_absolute():
+        path = ROOT / path
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
 
-def load_config(path=None):
-    path = Path(path) if path else ROOT / "configs" / "default.yaml"
-    with open(path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    cfg["root"] = str(ROOT)
-    cfg["data_dir"] = str(ROOT / cfg["data_dir"])
-    cfg["output_dir"] = str(ROOT / cfg["output_dir"])
-    return cfg
+def load_default() -> dict[str, Any]:
+    return load_yaml("configs/default.yaml")
+
+
+def load_datasets() -> dict[str, Any]:
+    return load_yaml("configs/datasets.yaml")
+
+
+def resolve(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path

@@ -1,1 +1,3 @@
-from .ceemdan import DecompositionCache, decompose_window, group_imfs
+from .ceemdan import group_imfs, window_ceemdan
+
+__all__ = ["group_imfs", "window_ceemdan"]

@@ -1,3 +1,4 @@
-from .dm_test import diebold_mariano_test, holm_adjust
-from .explainability import attention_shap_correlation
-from .cost import benchmark_model
+from .dm_test import diebold_mariano
+from .explainability import rank_features, spearman
+
+__all__ = ["diebold_mariano", "rank_features", "spearman"]

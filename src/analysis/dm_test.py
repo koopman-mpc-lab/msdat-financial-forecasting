@@ -1,41 +1,39 @@
+from __future__ import annotations
+
 import numpy as np
-from scipy import stats
 
 
-def _nw_variance(d, max_lag=None):
-    n = len(d)
-    if max_lag is None:
-        max_lag = int(np.floor(4 * (n / 100) ** (2 / 9)))
-    d = d - d.mean()
-    gamma0 = np.dot(d, d) / n
+def _newey_west(values: np.ndarray, lags: int | None = None) -> float:
+    n = len(values)
+    if lags is None:
+        lags = int(np.floor(n ** (1 / 3)))
+    centered = values - values.mean()
+    gamma0 = float(np.dot(centered, centered) / n)
     var = gamma0
-    for lag in range(1, max_lag + 1):
-        w = 1 - lag / (max_lag + 1)
-        gamma = np.dot(d[lag:], d[:-lag]) / n
-        var += 2 * w * gamma
-    return var / n
+    for lag in range(1, lags + 1):
+        gamma = float(np.dot(centered[lag:], centered[:-lag]) / n)
+        weight = 1.0 - lag / (lags + 1)
+        var += 2.0 * weight * gamma
+    return var
 
 
-def diebold_mariano_test(errors1, errors2):
-    d = np.asarray(errors1) ** 2 - np.asarray(errors2) ** 2
-    n = len(d)
-    var_d = _nw_variance(d)
-    if var_d <= 0:
-        return 0.0, 1.0
-    dm = d.mean() / np.sqrt(var_d)
-    p = 2 * (1 - stats.norm.cdf(abs(dm)))
-    return float(dm), float(p)
+def diebold_mariano(err_a: np.ndarray, err_b: np.ndarray) -> dict[str, float]:
+    """DM test on squared-error loss; positive statistic favours model a (MSDAT)."""
+    d = err_b ** 2 - err_a ** 2
+    mean = float(d.mean())
+    var = _newey_west(d)
+    stat = mean / np.sqrt(max(var, 1e-18) / len(d))
+    from math import erfc, sqrt
+    p = float(erfc(abs(stat) / sqrt(2.0)))
+    return {"dm_stat": float(stat), "p_value": p}
 
 
-def holm_adjust(p_values, alpha=0.05):
-    p = np.asarray(p_values)
-    order = np.argsort(p)
-    adjusted = np.ones_like(p)
-    m = len(p)
-    for i, idx in enumerate(order):
-        adjusted[idx] = min(1.0, p[idx] * (m - i))
-    for i in range(1, m):
-        idx = order[i]
-        prev = order[i - 1]
-        adjusted[idx] = max(adjusted[idx], adjusted[prev])
-    return adjusted.tolist(), [a < alpha for a in adjusted]
+def holm_adjust(p_values: list[float]) -> list[float]:
+    n = len(p_values)
+    order = np.argsort(p_values)
+    adjusted = [0.0] * n
+    running = 0.0
+    for rank, idx in enumerate(order):
+        running = max(running, (n - rank) * p_values[idx])
+        adjusted[idx] = min(1.0, running)
+    return adjusted

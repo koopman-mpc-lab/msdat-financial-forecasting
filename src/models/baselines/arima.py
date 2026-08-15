@@ -1,14 +1,27 @@
+from __future__ import annotations
+
 import numpy as np
-from statsmodels.tsa.arima.model import ARIMA
 
 
-def fit_arima_batch(close_windows, order=(1, 1, 1)):
-    preds = []
-    for w in close_windows:
+class ARIMABaseline:
+    """Rolling-window ARIMA(1,1,1) used as the statistical reference."""
+
+    order = (1, 1, 1)
+
+    def fit_predict_window(self, close: np.ndarray) -> float:
+        y = np.asarray(close, dtype=np.float64)
         try:
-            model = ARIMA(w, order=order)
-            res = model.fit()
-            preds.append(float(res.forecast(1)[0]))
+            from statsmodels.tsa.arima.model import ARIMA
+            fitted = ARIMA(y, order=self.order).fit()
+            return float(fitted.forecast(1)[0])
         except Exception:
-            preds.append(float(w[-1]))
-    return np.array(preds, dtype=np.float32)
+            if len(y) < 3:
+                return float(y[-1])
+            dy = np.diff(y)
+            return float(y[-1] + dy[-1])
+
+    def predict_batch(self, windows: np.ndarray, close_index: int = 3) -> np.ndarray:
+        return np.asarray(
+            [self.fit_predict_window(windows[i, :, close_index]) for i in range(len(windows))],
+            dtype=np.float32,
+        )

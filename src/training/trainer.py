@@ -1,119 +1,103 @@
-import time
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
 
-from src.training.loss import CompositeLoss
-from src.training.metrics import compute_metrics
+from ..models.msdat import count_params, format_param_line
+from .loss import CompositeLoss
+from .metrics import evaluate_arrays
 
 
 class Trainer:
-    def __init__(self, model, cfg, device=None):
+    def __init__(self, model, cfg: dict, device: str | None = None):
         self.model = model
         self.cfg = cfg
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer, factor=cfg["lr_decay"], patience=cfg["lr_patience"]
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if hasattr(model, "to"):
+            self.model.to(self.device)
+        loss_cfg = cfg.get("loss", {})
+        self.criterion = CompositeLoss(
+            lambda_quantile=loss_cfg.get("lambda_quantile", 0.3),
+            lambda_dir=loss_cfg.get("lambda_dir", 0.5),
+            lambda_vol=loss_cfg.get("lambda_vol", 0.1),
+            use_dir_loss=loss_cfg.get("use_dir_loss", True),
         )
-        self.criterion = CompositeLoss(cfg["lambda_quantile"], cfg["lambda_direction"], cfg["lambda_vol"])
-        self.best_val = float("inf")
-        self.patience_counter = 0
-        self.recent_preds = []
+        self.optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=cfg.get("lr", 1e-3),
+            weight_decay=cfg.get("weight_decay", 1e-4),
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=cfg.get("lr_factor", 0.5),
+            patience=cfg.get("lr_patience", 5),
+        )
 
-    def _forward(self, batch):
-        x = batch["x"].to(self.device)
-        vol = batch["vol"].to(self.device)
-        close = batch.get("close_window")
-        if close is not None:
-            close = close.to(self.device)
-        kwargs = {"vol": vol}
-        if hasattr(self.model, "forward") and "close_window" in self.model.forward.__code__.co_varnames:
-            kwargs["close_window"] = close
-        return self.model(x, **kwargs)
+    def param_line(self) -> str:
+        return format_param_line(count_params(self.model))
 
-    def train_epoch(self, loader):
-        self.model.train()
-        total = 0.0
-        for batch in loader:
-            self.optimizer.zero_grad()
-            out = self._forward(batch)
-            loss = self.criterion(out, batch, self.recent_preds)
-            loss.backward()
+    def _step(self, batch: dict, train: bool = True) -> dict[str, float]:
+        batch_t = {
+            k: v.to(self.device) if torch.is_tensor(v) else v
+            for k, v in batch.items()
+        }
+        out = self.model(batch_t["x"], scales=batch_t.get("scales"), vol=batch_t.get("vol"))
+        losses = self.criterion(out, batch_t)
+        if train:
+            self.optimizer.zero_grad(set_to_none=True)
+            losses["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.get("grad_clip", 1.0))
             self.optimizer.step()
-            total += loss.item()
-            self.recent_preds.append(out[0].detach().mean())
-            if len(self.recent_preds) > 20:
-                self.recent_preds.pop(0)
-        return total / max(len(loader), 1)
+        return {k: float(v.detach().cpu()) for k, v in losses.items()}
 
     @torch.no_grad()
-    def evaluate(self, loader, return_preds=False):
+    def predict_loader(self, loader: DataLoader) -> dict[str, np.ndarray]:
         self.model.eval()
-        preds, targets, raw_t, raw_p, p_t_list = [], [], [], [], []
-        total = 0.0
+        store = {k: [] for k in ("y_true", "y_pred", "q10", "q90", "p_last", "y_true_raw", "p_last_raw", "dir_logit")}
+        ids, dates, symbols = [], [], []
         for batch in loader:
-            out = self._forward(batch)
-            loss = self.criterion(out, batch)
-            total += loss.item()
-            preds.append(out[0].cpu().numpy())
-            targets.append(batch["y"].numpy())
-            raw_t.append(batch["y_raw"].numpy())
-            raw_p.append(out[0].cpu().numpy())
-            p_t_list.append(batch["p_t"].numpy())
-        preds = np.concatenate(preds)
-        targets = np.concatenate(targets)
-        metrics = compute_metrics(targets, preds, np.concatenate(raw_t), np.concatenate(raw_p), np.concatenate(p_t_list))
-        metrics["loss"] = total / max(len(loader), 1)
-        if return_preds:
-            return metrics, preds, targets, np.concatenate(raw_t), np.concatenate(p_t_list)
-        return metrics
+            batch_t = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            out = self.model(batch_t["x"], scales=batch_t.get("scales"), vol=batch_t.get("vol"))
+            store["y_true"].append(batch_t["y"].cpu().numpy())
+            store["y_pred"].append(out["point"].cpu().numpy())
+            store["q10"].append(out["q10"].cpu().numpy())
+            store["q90"].append(out["q90"].cpu().numpy())
+            store["p_last"].append(batch_t["p_last"].cpu().numpy())
+            store["y_true_raw"].append(batch_t["y_raw"].cpu().numpy())
+            store["p_last_raw"].append(batch_t["p_last_raw"].cpu().numpy())
+            store["dir_logit"].append(out["dir_logit"].cpu().numpy())
+            ids.extend(batch["id"])
+            dates.extend(batch["date"])
+            symbols.extend(batch["symbol"])
+        arrays = {k: np.concatenate(v, axis=0) for k, v in store.items()}
+        arrays["id"] = np.array(ids)
+        arrays["date"] = np.array(dates)
+        arrays["symbol"] = np.array(symbols)
+        return arrays
 
-    def fit(self, train_loader, val_loader, save_path=None):
-        history = []
-        for epoch in range(self.cfg["max_epochs"]):
-            train_loss = self.train_epoch(train_loader)
-            val_metrics = self.evaluate(val_loader)
-            self.scheduler.step(val_metrics["loss"])
-            history.append({"epoch": epoch, "train_loss": train_loss, **val_metrics})
-            if val_metrics["loss"] < self.best_val:
-                self.best_val = val_metrics["loss"]
-                self.patience_counter = 0
-                if save_path:
-                    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(self.model.state_dict(), save_path)
-            else:
-                self.patience_counter += 1
-                if self.patience_counter >= self.cfg["early_stop_patience"]:
-                    break
-        return history
+    def evaluate_loader(self, loader: DataLoader) -> dict[str, float]:
+        pred = self.predict_loader(loader)
+        scale = np.divide(
+            pred["y_true_raw"] - pred["p_last_raw"] + 1e-8,
+            pred["y_true"] - pred["p_last"] + 1e-8,
+        )
+        y_pred_raw = pred["p_last_raw"] + (pred["y_pred"] - pred["p_last"]) * np.abs(scale)
+        return evaluate_arrays(
+            pred["y_true"], pred["y_pred"], pred["p_last"],
+            pred["y_true_raw"], y_pred_raw, pred["q10"], pred["q90"],
+        )
 
-    def benchmark_inference(self, loader, n_warmup=10):
-        self.model.eval()
-        latencies = []
-        count = 0
-        with torch.no_grad():
-            for batch in loader:
-                x = batch["x"].to(self.device)
-                vol = batch["vol"].to(self.device)
-                if count < n_warmup:
-                    if hasattr(self.model, "forward"):
-                        kw = {"vol": vol}
-                        if "close_window" in self.model.forward.__code__.co_varnames:
-                            kw["close_window"] = batch.get("close_window", x[..., 3]).to(self.device)
-                        self.model(x, **kw)
-                    count += 1
-                    continue
-                t0 = time.perf_counter()
-                kw = {"vol": vol}
-                if "close_window" in self.model.forward.__code__.co_varnames:
-                    kw["close_window"] = batch.get("close_window", x[..., 3]).to(self.device)
-                self.model(x, **kw)
-                latencies.append((time.perf_counter() - t0) / x.size(0) * 1000)
-        return float(np.mean(latencies)) if latencies else 0.0
-
-    def count_parameters(self):
-        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+    def save(self, path: str | Path, extra: dict | None = None) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "cfg": self.cfg,
+            "param_stats": count_params(self.model),
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)

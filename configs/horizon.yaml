@@ -1,0 +1,4 @@
+horizons: [1, 3, 5, 7, 10]
+models: [iTransformer, MSDAT]
+datasets: [SPX, CSI300]
+seeds: [42, 43, 44, 45, 46]

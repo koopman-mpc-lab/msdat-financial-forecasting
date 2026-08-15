@@ -1,150 +1,216 @@
+from __future__ import annotations
+
 import math
-import numpy as np
+
 import torch
 import torch.nn as nn
-
-from src.decomposition.ceemdan import decompose_window
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=512):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(max_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, : x.size(1)]
+import torch.nn.functional as F
 
 
 class ChannelAttention(nn.Module):
-    def __init__(self, num_features):
+    def __init__(self, n_features: int = 12):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(num_features * 2, num_features // 2),
-            nn.ReLU(),
-            nn.Linear(num_features // 2, num_features),
-            nn.Sigmoid(),
-        )
+        hidden = max(n_features // 2, 1)
+        self.fc1 = nn.Linear(2 * n_features, hidden)
+        self.fc2 = nn.Linear(hidden, n_features)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, L, C)
         mean = x.mean(dim=1)
         std = x.std(dim=1, unbiased=False)
-        w = self.net(torch.cat([mean, std], dim=-1))
-        return x * w.unsqueeze(1), w
+        attn = torch.sigmoid(self.fc2(F.relu(self.fc1(torch.cat([mean, std], dim=-1)))))
+        return x * attn.unsqueeze(1), attn
 
 
 class TemporalEncoder(nn.Module):
-    def __init__(self, c_in, d_model, nhead, num_layers, ffn_dim, dropout):
+    def __init__(
+        self,
+        n_features: int,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        ffn_dim: int,
+        dropout: float,
+        max_len: int,
+        temporal: str = "attention",
+    ):
         super().__init__()
-        self.input_proj = nn.Linear(c_in, d_model)
-        self.pos = PositionalEncoding(d_model)
-        layer = nn.TransformerEncoderLayer(
-            d_model, nhead, ffn_dim, dropout, batch_first=True, activation="gelu"
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers)
+        self.temporal = temporal
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.pos = nn.Parameter(torch.zeros(1, max_len, d_model))
+        nn.init.normal_(self.pos, std=0.02)
+        if temporal == "gru":
+            self.encoder = nn.GRU(
+                d_model, d_model, num_layers=n_layers,
+                batch_first=True, dropout=dropout if n_layers > 1 else 0.0,
+            )
+            self.norm = nn.LayerNorm(d_model)
+        else:
+            layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=ffn_dim,
+                dropout=dropout,
+                batch_first=True,
+                activation="gelu",
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+            self.norm = nn.Identity()
 
-    def forward(self, x):
-        h = self.pos(self.input_proj(x))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.input_proj(x) + self.pos[:, : x.size(1)]
+        if self.temporal == "gru":
+            h, _ = self.encoder(h)
+            return self.norm(h)
         return self.encoder(h)
 
 
-class MSDAT(nn.Module):
-    def __init__(self, cfg):
+class VolatilityGate(nn.Module):
+    def __init__(self, d_model: int, n_scales: int):
         super().__init__()
-        self.cfg = cfg
-        c = cfg["num_features"]
-        d = cfg["embed_dim"]
-        self.num_scales = cfg["num_scales"]
-        self.tau1 = cfg["tau1"]
-        self.tau2 = cfg["tau2"]
-        self.ensemble = cfg["ceemdan_ensemble"]
-        self.use_decomp = cfg.get("use_decomposition", True)
-        self.use_channel_attn = cfg.get("use_channel_attention", True)
-        self.use_temporal_attn = cfg.get("use_temporal_attention", True)
-        self.use_gating = cfg.get("use_gating", True)
-        self.temporal_backend = cfg.get("temporal_backend", "transformer")
-        self.channel_attns = nn.ModuleList([ChannelAttention(c) for _ in range(self.num_scales)])
-        if self.use_temporal_attn:
-            if self.temporal_backend == "gru":
-                self.temporal_encoders = nn.ModuleList([
-                    nn.GRU(c, d, batch_first=True) for _ in range(self.num_scales)
-                ])
-            else:
-                self.temporal_encoders = nn.ModuleList([
-                    TemporalEncoder(c, d, cfg["num_heads"], cfg["num_layers"], cfg["ffn_dim"], cfg["dropout"])
-                    for _ in range(self.num_scales)
-                ])
-        else:
-            self.temporal_encoders = nn.ModuleList([
-                nn.GRU(c, d, batch_first=True) for _ in range(self.num_scales)
-            ])
-        self.gate = nn.Linear(d * self.num_scales + 1, self.num_scales)
-        self.head = nn.Sequential(
-            nn.Linear(d, d),
-            nn.ReLU(),
-            nn.Linear(d, 4),
+        self.proj = nn.Linear(n_scales * d_model + 1, n_scales)
+
+    def forward(self, branch_h: torch.Tensor, vol: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # branch_h: (B, S, L, D)
+        pooled = branch_h.mean(dim=2)
+        feat = torch.cat([pooled.flatten(1), vol.view(-1, 1)], dim=-1)
+        alpha = torch.softmax(self.proj(feat), dim=-1)
+        fused = (branch_h * alpha.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        return fused, alpha
+
+
+class PredictionHead(nn.Module):
+    def __init__(self, d_model: int, hidden: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 4),
         )
-        self._attn_weights = []
-        self._gate_weights = []
 
-    def _build_branches(self, x, close_window):
-        b, l, c = x.shape
-        branches = []
-        for i in range(b):
-            xi = x[i]
-            close = close_window[i].detach().cpu().numpy()
-            if self.use_decomp:
-                recon = decompose_window(
-                    close, self.ensemble, self.tau1, self.tau2, self.num_scales
+    def forward(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
+        out = self.net(h)
+        return {
+            "point": out[:, 0],
+            "q10": out[:, 1],
+            "q90": out[:, 2],
+            "dir_logit": out[:, 3],
+        }
+
+
+class MSDAT(nn.Module):
+    def __init__(
+        self,
+        n_features: int = 12,
+        n_scales: int = 3,
+        d_model: int = 256,
+        n_layers: int = 3,
+        n_heads: int = 8,
+        ffn_dim: int = 1024,
+        dropout: float = 0.1,
+        max_len: int = 128,
+        fusion_hidden: int = 1024,
+        use_channel_attention: bool = True,
+        temporal: str = "attention",
+        fixed_fusion: bool = False,
+    ):
+        super().__init__()
+        self.n_scales = n_scales
+        self.n_features = n_features
+        self.use_channel_attention = use_channel_attention
+        self.fixed_fusion = fixed_fusion
+        self.channel = nn.ModuleList(
+            [ChannelAttention(n_features) for _ in range(n_scales)]
+        )
+        self.encoders = nn.ModuleList(
+            [
+                TemporalEncoder(
+                    n_features, d_model, n_layers, n_heads, ffn_dim,
+                    dropout, max_len, temporal=temporal,
                 )
-            else:
-                recon = [close] * self.num_scales
-            scale_inputs = []
-            for s in range(self.num_scales):
-                branch = xi.clone()
-                branch[:, 3] = torch.from_numpy(recon[s].astype(np.float32)).to(x.device)
-                scale_inputs.append(branch)
-            branches.append(torch.stack(scale_inputs))
-        return torch.stack(branches)
+                for _ in range(n_scales)
+            ]
+        )
+        self.gate = VolatilityGate(d_model, n_scales)
+        self.fusion_ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, fusion_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_hidden, d_model),
+        )
+        self.head = PredictionHead(d_model)
+        self.close_index = 3
 
-    def forward(self, x, vol=None, close_window=None, return_aux=False):
-        if close_window is None:
-            close_window = x[..., 3]
-        branch_x = self._build_branches(x, close_window)
-        b, s, l, c = branch_x.shape
-        hs = []
-        attn_list = []
-        for si in range(s):
-            bx = branch_x[:, si]
-            if self.use_channel_attn:
-                bx, aw = self.channel_attns[si](bx)
-                attn_list.append(aw)
-            enc = self.temporal_encoders[si]
-            if self.use_temporal_attn and self.temporal_backend != "gru":
-                h = enc(bx)
+    def _assemble_branches(self, x: torch.Tensor, scales: torch.Tensor | None) -> torch.Tensor:
+        # x: (B, L, C); scales: (B, S, L) reconstructions of the close channel
+        if scales is None:
+            close = x[:, :, self.close_index]
+            scales = close.unsqueeze(1).expand(-1, self.n_scales, -1)
+        if scales.size(1) != self.n_scales:
+            if scales.size(1) == 1:
+                scales = scales.expand(-1, self.n_scales, -1)
+            elif scales.size(1) > self.n_scales:
+                scales = scales[:, : self.n_scales]
             else:
-                h, _ = enc(bx)
-            hs.append(h)
-        pooled = [h.mean(dim=1) for h in hs]
+                pad = scales[:, -1:].expand(-1, self.n_scales - scales.size(1), -1)
+                scales = torch.cat([scales, pad], dim=1)
+        branches = []
+        for s in range(self.n_scales):
+            branch = x.clone()
+            branch[:, :, self.close_index] = scales[:, s]
+            branches.append(branch)
+        return torch.stack(branches, dim=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        scales: torch.Tensor | None = None,
+        vol: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        branches = self._assemble_branches(x, scales)
+        encoded = []
+        attns = []
+        for s in range(self.n_scales):
+            xb = branches[:, s]
+            if self.use_channel_attention:
+                xb, attn = self.channel[s](xb)
+            else:
+                attn = torch.ones(x.size(0), x.size(-1), device=x.device, dtype=x.dtype) / x.size(-1)
+            encoded.append(self.encoders[s](xb))
+            attns.append(attn)
+        branch_h = torch.stack(encoded, dim=1)
         if vol is None:
-            vol = torch.zeros(b, 1, device=x.device)
+            vol = x.new_zeros(x.size(0))
+        if self.fixed_fusion or self.n_scales == 1:
+            alpha = torch.full(
+                (x.size(0), self.n_scales), 1.0 / self.n_scales,
+                device=x.device, dtype=x.dtype,
+            )
+            fused = branch_h.mean(dim=1)
         else:
-            vol = vol.view(b, 1)
-        if self.use_gating:
-            gate_in = torch.cat(pooled + [vol], dim=-1)
-            alpha = torch.softmax(self.gate(gate_in), dim=-1)
-            h_stack = torch.stack(hs, dim=1)
-            alpha_exp = alpha.unsqueeze(-1).unsqueeze(-1)
-            fused = (h_stack * alpha_exp).sum(dim=1)
-        else:
-            alpha = torch.full((b, s), 1.0 / s, device=x.device)
-            fused = torch.stack(hs, dim=1).mean(dim=1)
+            fused, alpha = self.gate(branch_h, vol)
+        fused = fused + self.fusion_ffn(fused)
         out = self.head(fused[:, -1])
-        point, q_low, q_high, direction = out[:, 0], out[:, 1], out[:, 2], out[:, 3]
-        if return_aux:
-            return point, q_low, q_high, direction, attn_list, alpha
-        return point, q_low, q_high, direction
+        out["alpha"] = alpha
+        out["channel_attn"] = torch.stack(attns, dim=1)
+        return out
+
+
+def count_params(module: nn.Module) -> dict[str, int]:
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    frozen = sum(p.numel() for p in module.parameters() if not p.requires_grad)
+    return {
+        "trainable": int(trainable),
+        "frozen_est": int(frozen),
+        "total_est": int(trainable + frozen),
+    }
+
+
+def format_param_line(stats: dict[str, int]) -> str:
+    return (
+        f"Trainable {stats['trainable']:,} | "
+        f"frozen_est {stats['frozen_est']:,} | "
+        f"total_est {stats['total_est']:,}"
+    )

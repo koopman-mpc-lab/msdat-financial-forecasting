@@ -1,40 +1,35 @@
+#!/usr/bin/env python
+"""Recompute metrics from a prediction CSV."""
+
+from __future__ import annotations
+
 import argparse
-import json
+import sys
 from pathlib import Path
 
-import torch
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-from src.config import load_config
-from src.data import load_splits, make_dataloader
-from src.models.factory import build_model
-from src.training.trainer import Trainer
+import pandas as pd
 
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", default=None)
-    p.add_argument("--dataset", required=True)
-    p.add_argument("--model", required=True)
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--save-preds", action="store_true")
-    return p.parse_args()
+from src.training.metrics import evaluate_arrays, summarize
 
 
-def main():
-    args = parse_args()
-    cfg = load_config(args.config)
-    _, _, test_ds, _ = load_splits(args.dataset, cfg)
-    test_loader = make_dataloader(test_ds, cfg["batch_size"])
-    model = build_model(args.model, cfg)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
-    trainer = Trainer(model, cfg, device)
-    metrics, preds, targets, raw_t, p_t = trainer.evaluate(test_loader, return_preds=True)
-    print(json.dumps(metrics, indent=2))
-    if args.save_preds:
-        out = Path(args.checkpoint).parent / "predictions.npz"
-        import numpy as np
-        np.savez(out, preds=preds, targets=targets, y_raw=raw_t, p_t=p_t)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pred", required=True)
+    args = parser.parse_args()
+    df = pd.read_csv(args.pred)
+    metrics = evaluate_arrays(
+        df["y_true"].to_numpy(),
+        df["y_pred"].to_numpy(),
+        df["p_last"].to_numpy(),
+        df["y_true_raw"].to_numpy() if "y_true_raw" in df else None,
+        df["y_pred_raw"].to_numpy() if "y_pred_raw" in df else None,
+        df["q10"].to_numpy() if "q10" in df else None,
+        df["q90"].to_numpy() if "q90" in df else None,
+    )
+    print(Path(args.pred).name, summarize(metrics))
 
 
 if __name__ == "__main__":

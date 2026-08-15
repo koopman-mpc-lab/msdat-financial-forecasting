@@ -1,119 +1,169 @@
-import math
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class _BaseTransformer(nn.Module):
-    def __init__(self, c_in, lookback, d_model, nhead, num_layers, ffn_dim=256):
+class _Head(nn.Module):
+    def __init__(self, d_model: int):
         super().__init__()
-        self.input_proj = nn.Linear(c_in, d_model)
-        self.pos = nn.Parameter(torch.randn(1, lookback, d_model) * 0.02)
-        layer = nn.TransformerEncoderLayer(
-            d_model, nhead, ffn_dim, 0.1, batch_first=True, activation="gelu"
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers)
-        self.head = nn.Linear(d_model, 1)
+        self.net = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 4))
 
-    def encode(self, x):
+    def forward(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
+        out = self.net(h)
+        return {"point": out[:, 0], "q10": out[:, 1], "q90": out[:, 2], "dir_logit": out[:, 3]}
+
+
+def _encoder(d_model: int, n_layers: int, n_heads: int, ffn_dim: int, dropout: float) -> nn.TransformerEncoder:
+    layer = nn.TransformerEncoderLayer(
+        d_model=d_model, nhead=n_heads, dim_feedforward=ffn_dim,
+        dropout=dropout, batch_first=True, activation="gelu", norm_first=True,
+    )
+    return nn.TransformerEncoder(layer, num_layers=n_layers)
+
+
+class iTransformer(nn.Module):
+    """Variate-token Transformer: attend over the C feature channels."""
+
+    def __init__(self, n_features=12, lookback=60, d_model=256, n_layers=4, n_heads=8, ffn_dim=1024, dropout=0.1, **_):
+        super().__init__()
+        self.lookback = lookback
+        self.embed = nn.Linear(lookback, d_model)
+        self.var_pos = nn.Parameter(torch.zeros(1, n_features, d_model))
+        self.encoder = _encoder(d_model, n_layers, n_heads, ffn_dim, dropout)
+        self.head = _Head(d_model)
+
+    def forward(self, x, scales=None, vol=None):
+        # x: (B, L, C) -> (B, C, L)
+        tokens = self.embed(x.transpose(1, 2)[:, :, : self.lookback])
+        if tokens.size(-1) != self.var_pos.size(-1):
+            tokens = tokens
+        h = self.encoder(tokens + self.var_pos[:, : tokens.size(1)])
+        return self.head(h.mean(dim=1))
+
+
+class PatchTST(nn.Module):
+    def __init__(
+        self, n_features=12, d_model=256, n_layers=4, n_heads=8, ffn_dim=1024,
+        patch_len=12, stride=8, dropout=0.1, max_patches=16, **_,
+    ):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.embed = nn.Linear(patch_len * n_features, d_model)
+        self.pos = nn.Parameter(torch.zeros(1, max_patches, d_model))
+        self.encoder = _encoder(d_model, n_layers, n_heads, ffn_dim, dropout)
+        self.head = _Head(d_model)
+
+    def forward(self, x, scales=None, vol=None):
+        b, length, c = x.shape
+        patches = x.unfold(1, self.patch_len, self.stride)
+        if patches.size(1) == 0:
+            pad = F.pad(x, (0, 0, 0, self.patch_len - length))
+            patches = pad.unfold(1, self.patch_len, self.stride)
+        tokens = self.embed(patches.reshape(b, patches.size(1), -1))
+        h = self.encoder(tokens + self.pos[:, : tokens.size(1)])
+        return self.head(h.mean(dim=1))
+
+
+class Informer(nn.Module):
+    def __init__(self, n_features=12, d_model=256, n_layers=4, n_heads=8, ffn_dim=1024, dropout=0.1, max_len=128, **_):
+        super().__init__()
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.pos = nn.Parameter(torch.zeros(1, max_len, d_model))
+        self.encoder = _encoder(d_model, n_layers, n_heads, ffn_dim, dropout)
+        self.distill = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
+        self.head = _Head(d_model)
+
+    def forward(self, x, scales=None, vol=None):
         h = self.input_proj(x) + self.pos[:, : x.size(1)]
-        return self.encoder(h)
-
-    def predict(self, h):
-        return self.head(h[:, -1]).squeeze(-1)
-
-    def forward(self, x, **kwargs):
-        y = self.predict(self.encode(x))
-        z = torch.zeros_like(y)
-        return y, y, y, z
+        h = self.encoder(h)
+        h = self.distill(h.transpose(1, 2)).transpose(1, 2)
+        return self.head(h[:, -1])
 
 
-class InformerModel(_BaseTransformer):
-    def __init__(self, c_in, lookback, d_model, nhead, num_layers):
-        super().__init__(c_in, lookback, d_model, nhead, num_layers)
-        self.distil = nn.AvgPool1d(2)
-
-
-class AutoformerModel(_BaseTransformer):
-    def __init__(self, c_in, lookback, d_model, nhead, num_layers):
-        super().__init__(c_in, lookback, d_model, nhead, num_layers)
-        self.decomp = nn.AvgPool1d(3, stride=1, padding=1)
-
-    def encode(self, x):
-        trend = self.decomp(x.transpose(1, 2)).transpose(1, 2)
-        seasonal = x - trend
-        h = self.input_proj(seasonal) + self.pos[:, : x.size(1)]
-        return self.encoder(h) + self.input_proj(trend)
-
-
-class TimesNetModel(nn.Module):
-    def __init__(self, c_in, lookback, d_model, k=3):
+class Autoformer(nn.Module):
+    def __init__(self, n_features=12, d_model=256, n_layers=4, n_heads=8, ffn_dim=1024, dropout=0.1, max_len=128, **_):
         super().__init__()
-        self.k = k
-        self.convs = nn.ModuleList([
-            nn.Conv1d(c_in, d_model, 3, padding=1) for _ in range(k)
-        ])
-        self.head = nn.Linear(d_model, 1)
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.season_proj = nn.Linear(n_features, d_model)
+        self.pos = nn.Parameter(torch.zeros(1, max_len, d_model))
+        self.encoder = _encoder(d_model, n_layers, n_heads, ffn_dim, dropout)
+        self.decomp = nn.AvgPool1d(kernel_size=25, stride=1, padding=12)
+        self.head = _Head(d_model)
 
-    def forward(self, x, **kwargs):
-        xc = x.transpose(1, 2)
-        feats = [conv(xc).transpose(1, 2) for conv in self.convs]
-        h = torch.stack(feats, dim=0).mean(0)
-        y = self.head(h[:, -1]).squeeze(-1)
-        z = torch.zeros_like(y)
-        return y, y, y, z
+    def forward(self, x, scales=None, vol=None):
+        trend = self.decomp(x.transpose(1, 2)).transpose(1, 2)[:, : x.size(1)]
+        if trend.size(1) != x.size(1):
+            trend = F.pad(trend, (0, 0, 0, x.size(1) - trend.size(1)))[:, : x.size(1)]
+        season = x - trend
+        h = self.input_proj(season) + self.season_proj(trend) + self.pos[:, : x.size(1)]
+        h = self.encoder(h)
+        return self.head(h[:, -1])
 
 
-class NHiTSModel(nn.Module):
-    def __init__(self, c_in, lookback, hidden=128, stacks=3):
+class TimesNet(nn.Module):
+    def __init__(self, n_features=12, d_model=256, n_layers=4, n_kernels=3, mixer_hidden=1536, dropout=0.1, **_):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(c_in * lookback, hidden),
-                nn.ReLU(),
-                nn.Linear(hidden, lookback),
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.blocks = nn.ModuleList()
+        self.mixers = nn.ModuleList()
+        for _ in range(n_layers):
+            convs = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Conv2d(1, 16, kernel_size=k, padding=k // 2),
+                        nn.GELU(),
+                        nn.Conv2d(16, 1, kernel_size=1),
+                    )
+                    for k in range(3, 3 + 2 * n_kernels, 2)
+                ]
             )
-            for _ in range(stacks)
-        ])
-        self.head = nn.Linear(lookback, 1)
+            self.blocks.append(convs)
+            self.mixers.append(nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, mixer_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(mixer_hidden, d_model),
+            ))
+        self.norm = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.head = _Head(d_model)
 
-    def forward(self, x, **kwargs):
-        flat = x.reshape(x.size(0), -1)
-        residual = x[:, :, 3]
-        for block in self.blocks:
-            residual = residual + block(flat).view_as(residual)
-        y = self.head(residual).squeeze(-1)
-        z = torch.zeros_like(y)
-        return y, y, y, z
-
-
-class PatchTSTModel(_BaseTransformer):
-    def __init__(self, c_in, lookback, d_model, nhead, num_layers, patch=6):
-        super().__init__(c_in, lookback, d_model, nhead, num_layers)
-        self.patch = patch
-        self.patch_proj = nn.Linear(c_in * patch, d_model)
-
-    def encode(self, x):
-        b, l, c = x.shape
-        p = self.patch
-        n = l // p
-        x = x[:, : n * p].reshape(b, n, p * c)
-        h = self.patch_proj(x) + self.pos[:, :n]
-        return self.encoder(h)
+    def forward(self, x, scales=None, vol=None):
+        h = self.input_proj(x)
+        for convs, mixer in zip(self.blocks, self.mixers):
+            z = h.unsqueeze(1)
+            acc = 0
+            for conv in convs:
+                acc = acc + conv(z)
+            h = self.norm(h + acc.squeeze(1))
+            h = h + mixer(h)
+        h = self.out_proj(h)
+        return self.head(h[:, -1])
 
 
-class iTransformerModel(nn.Module):
-    def __init__(self, c_in, lookback, d_model, nhead, num_layers, ffn_dim=256):
+class NHiTS(nn.Module):
+    def __init__(self, n_features=12, lookback=60, d_model=128, n_blocks=3, n_layers_per_block=2, hidden=256, dropout=0.1, **_):
         super().__init__()
-        self.var_proj = nn.Linear(lookback, d_model)
-        layer = nn.TransformerEncoderLayer(
-            d_model, nhead, ffn_dim, 0.1, batch_first=True, activation="gelu"
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers)
-        self.head = nn.Linear(c_in * d_model, 1)
+        self.lookback = lookback
+        self.blocks = nn.ModuleList()
+        in_dim = lookback * n_features
+        for _ in range(n_blocks):
+            layers = []
+            last = in_dim
+            for _ in range(n_layers_per_block):
+                layers.extend([nn.Linear(last, hidden), nn.ReLU(), nn.Dropout(dropout)])
+                last = hidden
+            layers.append(nn.Linear(hidden, d_model))
+            self.blocks.append(nn.Sequential(*layers))
+        self.head = _Head(d_model)
 
-    def forward(self, x, **kwargs):
-        v = self.var_proj(x.transpose(1, 2))
-        h = self.encoder(v)
-        y = self.head(h.reshape(h.size(0), -1)).squeeze(-1)
-        z = torch.zeros_like(y)
-        return y, y, y, z
+    def forward(self, x, scales=None, vol=None):
+        flat = x[:, : self.lookback].reshape(x.size(0), -1)
+        h = 0
+        for block in self.blocks:
+            h = h + block(flat)
+        return self.head(h)

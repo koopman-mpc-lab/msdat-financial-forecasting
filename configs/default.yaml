@@ -1,46 +1,96 @@
 seed: 42
 lookback: 60
 horizon: 1
-num_features: 12
-num_scales: 3
-tau1: 5
-tau2: 20
-ceemdan_ensemble: 50
-decomp_refresh: 5
-embed_dim: 64
-num_heads: 4
-num_layers: 2
-ffn_dim: 256
-dropout: 0.1
-lambda_quantile: 0.3
-lambda_direction: 0.5
-lambda_vol: 0.1
+n_scales: 3
+n_features: 12
 batch_size: 64
+max_epochs: 80
+patience: 15
 lr: 0.001
-lr_decay: 0.5
+lr_factor: 0.5
 lr_patience: 5
-early_stop_patience: 15
-max_epochs: 200
-num_seeds: 5
-train_ratio: 0.70
-val_ratio: 0.15
-test_ratio: 0.15
-datasets:
-  - spx
-  - csi300
-  - nasdaq20
-  - btc_usd
-models:
-  - arima
-  - gru
-  - lstm
-  - cnn_lstm
-  - informer
-  - autoformer
-  - timesnet
-  - nhits
-  - patchtst
-  - itransformer
-  - msdat
-data_dir: data/processed
-output_dir: outputs
+weight_decay: 0.0001
+grad_clip: 1.0
+num_workers: 0
+
+loss:
+  lambda_quantile: 0.3
+  lambda_dir: 0.5
+  lambda_vol: 0.1
+  quantiles: [0.1, 0.9]
+
+decomposition:
+  ensemble: 50
+  tau_high: 5
+  tau_mid: 20
+  refresh_every: 5
+  cache_dir: data/features/ceemdan_cache
+
+msdat:
+  d_model: 256
+  n_layers: 3
+  n_heads: 8
+  ffn_dim: 1024
+  dropout: 0.1
+  max_len: 128
+  fusion_hidden: 1456
+
+baselines:
+  gru:
+    hidden_size: 128
+    n_layers: 2
+    dropout: 0.1
+  lstm:
+    hidden_size: 128
+    n_layers: 2
+    dropout: 0.1
+  cnn_lstm:
+    conv_channels: 32
+    kernel_size: 3
+    hidden_size: 128
+    n_layers: 2
+    dropout: 0.1
+  nhits:
+    d_model: 160
+    n_blocks: 3
+    n_layers_per_block: 2
+    hidden: 288
+    dropout: 0.1
+  itransformer:
+    d_model: 256
+    n_layers: 7
+    n_heads: 8
+    ffn_dim: 1024
+    dropout: 0.1
+  patchtst:
+    d_model: 256
+    n_layers: 9
+    n_heads: 8
+    ffn_dim: 1024
+    patch_len: 12
+    stride: 8
+    dropout: 0.1
+  timesnet:
+    d_model: 256
+    n_layers: 5
+    n_kernels: 3
+    mixer_hidden: 1792
+    dropout: 0.1
+  informer:
+    d_model: 384
+    n_layers: 6
+    n_heads: 8
+    ffn_dim: 1536
+    dropout: 0.1
+  autoformer:
+    d_model: 384
+    n_layers: 6
+    n_heads: 8
+    ffn_dim: 1536
+    dropout: 0.1
+
+paths:
+  data_root: data
+  results_root: results
+  log_root: logs
+  ckpt_root: checkpoints

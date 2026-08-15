@@ -1,43 +1,38 @@
+#!/usr/bin/env python
+"""Train the multi-horizon grid from configs/horizon.yaml."""
+
+from __future__ import annotations
+
 import argparse
-import json
 import subprocess
 import sys
 from pathlib import Path
 
-from src.config import load_config
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.config import load_yaml
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", default=None)
-    p.add_argument("--dataset", default="spx")
-    p.add_argument("--models", nargs="+", default=["msdat", "itransformer"])
-    p.add_argument("--horizons", nargs="+", type=int, default=[1, 5, 10])
-    p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    cfg = load_config(args.config)
-    root = Path(__file__).resolve().parents[1]
-    results = {}
-    for h in args.horizons:
-        results[h] = {}
-        for model in args.models:
-            cmd = [sys.executable, str(root / "scripts" / "train.py"),
-                   "--dataset", args.dataset, "--model", model,
-                   "--seed", str(args.seed), "--horizon", str(h)]
-            if args.config:
-                cmd += ["--config", args.config]
-            subprocess.run(cmd, check=True, cwd=str(root))
-            mpath = Path(cfg["output_dir"]) / args.dataset / model / f"seed_{args.seed}" / "metrics.json"
-            with open(mpath, encoding="utf-8") as f:
-                results[h][model] = json.load(f)
-    out = Path(cfg["output_dir"]) / f"multi_horizon_{args.dataset}.json"
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    print(f"Saved {out}")
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    args = parser.parse_args()
+    cfg = load_yaml("configs/horizon.yaml")
+    datasets = [args.dataset] if args.dataset else cfg["datasets"]
+    seeds = [args.seed] if args.seed is not None else cfg["seeds"]
+    for dataset in datasets:
+        for model in cfg["models"]:
+            for horizon in cfg["horizons"]:
+                for seed in seeds:
+                    cmd = [
+                        sys.executable, str(ROOT / "scripts" / "train.py"),
+                        "--model", model, "--dataset", dataset,
+                        "--seed", str(seed), "--horizon", str(horizon),
+                    ]
+                    print(" ".join(cmd))
+                    subprocess.run(cmd, check=True, cwd=str(ROOT))
 
 
 if __name__ == "__main__":
